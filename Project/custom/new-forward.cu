@@ -2,6 +2,8 @@
 #include <iostream>
 #include "gpu-new-forward.h"
 
+#define TILE_WIDTH 8
+
 __global__ void conv_forward_kernel(float *output, const float *input, const float *mask, const int Batch, const int Map_out, const int Channel, const int Height, const int Width, const int K)
 {
     /*
@@ -23,8 +25,10 @@ __global__ void conv_forward_kernel(float *output, const float *input, const flo
 
     const int Height_out = Height - K + 1;
     const int Width_out = Width - K + 1;
+    const int Width_grid = ceil(1.0 * Width_out / TILE_WIDTH);
     (void)Height_out; // silence declared but never referenced warning. remove this line when you start working
     (void)Width_out; // silence declared but never referenced warning. remove this line when you start working
+    (void)Width_grid;
 
     // We have some nice #defs for you below to simplify indexing. Feel free to use them, or create your own.
     // An example use of these macros:
@@ -36,7 +40,23 @@ __global__ void conv_forward_kernel(float *output, const float *input, const flo
     #define mask_4d(i3, i2, i1, i0) mask[(i3) * (Channel * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
     // Insert your GPU convolution kernel code here
-    
+
+    int b = blockIdx.x;
+    int m = blockIdx.y;
+    int h = blockIdx.z / Width_grid * TILE_WIDTH + threadIdx.y;
+    int w = blockIdx.z % Width_grid * TILE_WIDTH + threadIdx.x;
+
+    if (h < Height_out && w < Width_out) {
+        float acc = 0.;
+        for (int c = 0; c < Channel; c++) {
+            for (int p = 0; p < K; p++) {
+                for (int q = 0; q < K; q++) {
+                    acc += in_4d(b, c, h+p, w+q) * mask_4d(m, c, p, q);
+                }
+            }
+        }
+        out_4d(b, m, h, w) = acc;
+    }
 
     #undef out_4d
     #undef in_4d
@@ -59,12 +79,40 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
     //     exit(-1);
     // }
 
+    const int Height_out = Height - K + 1;
+    const int Width_out = Width - K + 1;
+
+    cudaMalloc((void **) device_input_ptr, Batch * Channel * Width * Height * sizeof(float));
+    cudaMalloc((void **) device_mask_ptr, Map_out * Channel * K * K * sizeof(float));
+    cudaMalloc((void **) device_output_ptr, Batch * Map_out * Width_out * Height_out * sizeof(float));
+
+    cudaMemcpy(*device_input_ptr, host_input, Batch * Channel * Width * Height * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(*device_mask_ptr, host_mask, Map_out * Channel * K * K * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Useful snippet for error checking
+    cudaError_t error = cudaGetLastError();
+    if(error != cudaSuccess) {
+        std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
+        exit(-1);
+    }
+
 }
 
 
 __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *device_input, const float *device_mask, const int Batch, const int Map_out, const int Channel, const int Height, const int Width, const int K)
 {
     // Set the kernel dimensions and call the kernel
+
+    const int Height_out = Height - K + 1;
+    const int Width_out = Width - K + 1;
+
+    const int Width_grid = ceil(1.0 * Width_out / TILE_WIDTH);
+    const int Height_grid = ceil(1.0 * Height_out / TILE_WIDTH);
+    const int Z = Width_grid * Height_grid;
+
+    dim3 dimBlock(TILE_WIDTH, TILE_WIDTH, 1);
+    dim3 dimGrid(Batch, Map_out, Z);
+    conv_forward_kernel<<<dimGrid, dimBlock>>>(device_output, device_input, device_mask, Batch, Map_out, Channel, Height, Width, K);
 
 }
 
@@ -73,7 +121,16 @@ __host__ void GPUInterface::conv_forward_gpu_epilog(float *host_output, float *d
 {
     // Copy the output back to host
 
+    const int Height_out = Height - K + 1;
+    const int Width_out = Width - K + 1;
+
+    cudaMemcpy(host_output, device_output, Batch * Map_out * Width_out * Height_out * sizeof(float), cudaMemcpyDeviceToHost);
+
     // Free device memory
+
+    cudaFree(device_input);
+    cudaFree(device_output);
+    cudaFree(device_mask);
 
 }
 
